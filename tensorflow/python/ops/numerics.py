@@ -38,7 +38,7 @@ def verify_tensor_all_finite(t, msg, name=None):
   """
   with ops.op_scope([t], name, "VerifyFinite") as name:
     t = ops.convert_to_tensor(t, name="t")
-    with ops.device(t.device):
+    with ops.colocate_with(t):
       verify_input = array_ops.check_numerics(t, message=msg)
       out = control_flow_ops.with_dependencies([verify_input], t)
   return out
@@ -62,7 +62,7 @@ def add_check_numerics_ops():
   # added, and ops can only be added once its inputs are added.
   for op in ops.get_default_graph().get_operations():
     for output in op.outputs:
-      if output.dtype in [dtypes.float32, dtypes.float64]:
+      if output.dtype in [dtypes.float16, dtypes.float32, dtypes.float64]:
         message = op.name + ":" + str(output.value_index)
         with ops.control_dependencies(check_op):
           check_op = [array_ops.check_numerics(output, message=message)]

@@ -18,17 +18,14 @@ limitations under the License.
 
 // This file contains utilities for various operations.
 
+#include <array>
+
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/util/padding.h"
 
 namespace tensorflow {
-
-// Call this function from a test if op kernels are not being
-// registered.  This can happen if the test is linked in a shared
-// mode and has no direct references to any code from this directory.
-void RequireDefaultOps();
 
 // Get2dOutputSize(): Given an input tensor, kernel, stride and padding
 // type, the function computes the output and padding dimensions.
@@ -94,6 +91,19 @@ Status Get2dOutputSizeVerbose(const int in_height, const int in_width,
                               int* new_height, int* new_width, int* pad_top,
                               int* pad_bottom, int* pad_left, int* pad_right);
 
+// Given an input tensor, kernel, stride and padding type, populates the 3D size
+// of the output tensor and padding to be applied to the input tensor at the
+// lower end of every dimension. Use for 3D convolutions, where the input data
+// is padded with zeros, as well as for 3D avg/max pooling, where the input data
+// is padded with invalid values that are not considered for pooling.
+//
+// TODO(mjanusz): Unify this with Get2dOutputSize by using a common template.
+Status Get3dOutputSize(const std::array<int64, 3>& input,
+                       const std::array<int64, 3>& window,
+                       const std::array<int64, 3>& strides,
+                       Padding padding_type, std::array<int64, 3>* output,
+                       std::array<int64, 3>* padding);
+
 // Calculates broadcast starting index and size.  For SAME padding, addition
 // padding could be applied to right, left, top and bottom.  Depending on the
 // current index, input size, kernel size, stride, padding size, the starting
@@ -109,7 +119,7 @@ Eigen::PaddingType BrainPadding2EigenPadding(Padding padding);
 
 // Given a shape 's' of a tensor of type T. Returns true iff the
 // number of bytes occupied by each dim 0 (i.e., &tensor(i + 1, ...) -
-// &tensor(i, ...)) is multiple of EIGEN_ALIGN_BYTES.
+// &tensor(i, ...)) is multiple of EIGEN_MAX_ALIGN_BYTES.
 template <typename T>
 bool IsInnerDimsSizeAligned(const TensorShape& s) {
   if (s.dims() == 0) return false;
@@ -189,6 +199,9 @@ void Col2im(const T* col_data, const int depth, const int height,
     h_pad += stride_h;
   }
 }
+
+// Returns <suffix> sanitized to have only [a-zA-Z0-9-_].
+string SanitizeThreadSuffix(string suffix);
 
 }  // namespace tensorflow
 

@@ -22,6 +22,12 @@ import numpy as np
 import tensorflow as tf
 
 
+@tf.RegisterGradient("BadGrad")
+def _bad_grad(unused_op, grad):
+  """A gradient that returns the wrong shape."""
+  return tf.transpose(grad)
+
+
 class GradientCheckerTest(tf.test.TestCase):
 
   def testAddSimple(self):
@@ -109,6 +115,50 @@ class GradientCheckerTest(tf.test.TestCase):
       error = tf.test.compute_gradient_error(params, p_shape, y2, y2_shape)
     tf.logging.info("nested gather error = %f", error)
     assert error < 1e-4
+
+  def testComplexMul(self):
+    with self.test_session():
+      size = ()
+      c = tf.constant(5 + 7j, dtype=tf.complex64)
+      x = tf.constant(11 - 13j, dtype=tf.complex64)
+      y = c * x
+      analytical, numerical = tf.test.compute_gradient(x, size, y, size)
+      correct = np.array([[5, 7], [-7, 5]])
+      self.assertAllEqual(correct, analytical)
+      self.assertAllClose(correct, numerical, rtol=1e-4)
+      self.assertLess(tf.test.compute_gradient_error(x, size, y, size), 2e-4)
+
+  def testComplexConj(self):
+    with self.test_session():
+      size = ()
+      x = tf.constant(11 - 13j, dtype=tf.complex64)
+      y = tf.conj(x)
+      analytical, numerical = tf.test.compute_gradient(x, size, y, size)
+      correct = np.array([[1, 0], [0, -1]])
+      self.assertAllEqual(correct, analytical)
+      self.assertAllClose(correct, numerical, rtol=3e-6)
+      self.assertLess(tf.test.compute_gradient_error(x, size, y, size), 2e-5)
+
+  def testEmptySucceeds(self):
+    with self.test_session():
+      x = tf.placeholder(tf.float32)
+      y = tf.identity(x)
+      for grad in tf.test.compute_gradient(x, (0, 3), y, (0, 3)):
+        self.assertEqual(grad.shape, (0, 0))
+      error = tf.test.compute_gradient_error(x, (0, 3), y, (0, 3))
+      self.assertEqual(error, 0)
+
+  def testEmptyFails(self):
+    with tf.Graph().as_default() as g:
+      with self.test_session(graph=g):
+        x = tf.placeholder(tf.float32)
+        with g.gradient_override_map({"Identity": "BadGrad"}):
+          y = tf.identity(x)
+        bad = r"Empty gradient has wrong shape: expected \(0, 3\), got \(3, 0\)"
+        with self.assertRaisesRegexp(ValueError, bad):
+          tf.test.compute_gradient(x, (0, 3), y, (0, 3))
+        with self.assertRaisesRegexp(ValueError, bad):
+          tf.test.compute_gradient_error(x, (0, 3), y, (0, 3))
 
 
 # Gradient checker for MNIST.

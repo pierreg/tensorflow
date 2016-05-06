@@ -24,7 +24,6 @@ limitations under the License.
 #include "tensorflow/core/kernels/fill_functor.h"
 
 #if GOOGLE_CUDA
-#include "tensorflow/core/common_runtime/gpu_device_context.h"
 #include "tensorflow/core/platform/stream_executor.h"
 #endif  // GOOGLE_CUDA
 
@@ -84,7 +83,7 @@ struct LaunchMatMul<GPUDevice, T, true /* USE_CUBLAS */> {
     auto blas_transpose_a = trans[transpose_a];
     auto blas_transpose_b = trans[transpose_b];
 
-    auto* stream = ctx->op_device_context<GPUDeviceContext>()->stream();
+    auto* stream = ctx->op_device_context()->stream();
     OP_REQUIRES(ctx, stream, errors::Internal("No GPU stream available."));
 
     auto a_ptr = AsDeviceMemory(a.template flat<T>().data());
@@ -107,18 +106,6 @@ struct LaunchMatMul<GPUDevice, T, true /* USE_CUBLAS */> {
           a.dim_size(1), "), b.shape=(", b.dim_size(0), ", ", b.dim_size(1),
           "), m=", m, ", n=", n, ", k=", k));
     }
-  }
-};
-
-template <typename T>
-struct LaunchMatMul<GPUDevice, T, false /* USE_CUBLAS */> {
-  static void launch(
-      OpKernelContext* ctx, OpKernel* kernel, const Tensor& a, const Tensor& b,
-      const Eigen::array<Eigen::IndexPair<Eigen::DenseIndex>, 1>& dim_pair,
-      Tensor* out) {
-    functor::MatMulFunctor<GPUDevice, T>()(ctx->eigen_device<GPUDevice>(),
-                                           out->matrix<T>(), a.matrix<T>(),
-                                           b.matrix<T>(), dim_pair);
   }
 };
 
@@ -204,18 +191,15 @@ struct MatMulFunctor<CPUDevice, T> {
       Name("MatMul").Device(DEVICE_CPU).TypeConstraint<T>("T").Label("eigen"), \
       MatMulOp<CPUDevice, T, false /* cublas, ignored for CPU */>)
 
-#define REGISTER_GPU(T)                                                        \
-  REGISTER_KERNEL_BUILDER(                                                     \
-      Name("MatMul").Device(DEVICE_GPU).TypeConstraint<T>("T"),                \
-      MatMulOp<GPUDevice, T, true /* cublas, true by default */>);             \
-  REGISTER_KERNEL_BUILDER(Name("MatMul")                                       \
-                              .Device(DEVICE_GPU)                              \
-                              .TypeConstraint<T>("T")                          \
-                              .Label("cublas"),                                \
-                          MatMulOp<GPUDevice, T, true /* cublas */>);          \
-  REGISTER_KERNEL_BUILDER(                                                     \
-      Name("MatMul").Device(DEVICE_GPU).TypeConstraint<T>("T").Label("eigen"), \
-      MatMulOp<GPUDevice, T, false /* cublas */>)
+#define REGISTER_GPU(T)                                            \
+  REGISTER_KERNEL_BUILDER(                                         \
+      Name("MatMul").Device(DEVICE_GPU).TypeConstraint<T>("T"),    \
+      MatMulOp<GPUDevice, T, true /* cublas, true by default */>); \
+  REGISTER_KERNEL_BUILDER(Name("MatMul")                           \
+                              .Device(DEVICE_GPU)                  \
+                              .TypeConstraint<T>("T")              \
+                              .Label("cublas"),                    \
+                          MatMulOp<GPUDevice, T, true /* cublas */>)
 
 REGISTER_CPU(float);
 REGISTER_CPU(double);

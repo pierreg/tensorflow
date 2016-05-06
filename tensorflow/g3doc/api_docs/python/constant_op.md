@@ -176,9 +176,8 @@ Creates a constant tensor.
  elements specified by `shape`, the last element in the list will be used
  to fill the remaining entries.
 
- The argument `shape` is optional. If present, it specifies the dimensions
- of the resulting tensor. If not present, then the tensor is a scalar (0-D)
- if `value` is a scalar, or 1-D otherwise.
+ The argument `shape` is optional. If present, it specifies the dimensions of
+ the resulting tensor. If not present, the shape of `value` is used.
 
  If the argument `dtype` is not specified, then the type is inferred from
  the type of `value`.
@@ -322,9 +321,11 @@ print(sess.run(norm))
 print(sess.run(norm))
 
 # Set an op-level seed to generate repeatable sequences across sessions.
-c = tf.constant([[1, 2], [3, 4], [5, 6]])
+norm = tf.random_normal([2, 3], seed=1234)
 sess = tf.Session()
-norm = tf.random_normal(c, seed=1234)
+print(sess.run(norm))
+print(sess.run(norm))
+sess = tf.Session()
 print(sess.run(norm))
 print(sess.run(norm))
 ```
@@ -501,6 +502,37 @@ For example, RGB images can be cropped with
 ##### Returns:
 
   A cropped tensor of the same rank as `value` and shape `size`.
+
+
+- - -
+
+### `tf.multinomial(logits, num_samples, seed=None, name=None)` {#multinomial}
+
+Draws samples from a multinomial distribution.
+
+Example:
+
+  samples = tf.multinomial(tf.log([[0.5, 0.5]]), 10)
+  # samples has shape [1, 10], where each value is either 0 or 1.
+
+  samples = tf.multinomial([[1, -1, -1]], 10)
+  # samples is equivalent to tf.zeros([1, 10], dtype=tf.int64).
+
+##### Args:
+
+
+*  <b>`logits`</b>: 2-D Tensor with shape `[batch_size, num_classes]`.  Each slice
+    `[i, :]` represents the unnormalized log probabilities for all classes.
+*  <b>`num_samples`</b>: 0-D.  Number of independent samples to draw for each row slice.
+*  <b>`seed`</b>: A Python integer. Used to create a random seed for the distribution.
+    See
+    [`set_random_seed`](../../api_docs/python/constant_op.md#set_random_seed)
+    for behavior.
+*  <b>`name`</b>: Optional name for the operation.
+
+##### Returns:
+
+  The drawn samples of shape `[batch_size, num_samples]`.
 
 
 - - -

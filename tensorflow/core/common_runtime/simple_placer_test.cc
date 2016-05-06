@@ -110,6 +110,9 @@ REGISTER_OP("TestRelu").Input("i: float").Output("o: float");
 REGISTER_KERNEL_BUILDER(Name("TestRelu").Device(DEVICE_CPU), DummyOp);
 REGISTER_KERNEL_BUILDER(Name("TestRelu").Device(DEVICE_GPU), DummyOp);
 
+REGISTER_OP("ReluCPU").Input("i: float").Output("o: float");
+REGISTER_KERNEL_BUILDER(Name("ReluCPU").Device(DEVICE_CPU), DummyOp);
+
 REGISTER_OP("ReluGPU").Input("i: float").Output("o: float");
 REGISTER_KERNEL_BUILDER(Name("ReluGPU").Device(DEVICE_GPU), DummyOp);
 
@@ -125,6 +128,11 @@ REGISTER_KERNEL_BUILDER(Name("AssignGPU").Device(DEVICE_GPU), DummyOp);
 
 REGISTER_OP("TestInput").Output("a: float").Output("b: float");
 REGISTER_KERNEL_BUILDER(Name("TestInput").Device(DEVICE_CPU), DummyOp);
+
+// Op producing an output that can be placed on CPU or GPU.
+REGISTER_OP("TestCPUGPUOutput").Output("a: float");
+REGISTER_KERNEL_BUILDER(Name("TestCPUGPUOutput").Device(DEVICE_CPU), DummyOp);
+REGISTER_KERNEL_BUILDER(Name("TestCPUGPUOutput").Device(DEVICE_GPU), DummyOp);
 
 REGISTER_OP("TestDevice").Output("a: float").Output("b: float");
 REGISTER_KERNEL_BUILDER(Name("TestDevice").Device(DEVICE_GPU), DummyOp);
@@ -146,7 +154,6 @@ REGISTER_KERNEL_BUILDER(Name("TestDeviceEnforce").Device(DEVICE_GPU), DummyOp);
 class SimplePlacerTest : public ::testing::Test {
  protected:
   SimplePlacerTest() {
-    RequireDefaultOps();
     // Build a set of 10 GPU and 10 CPU devices.
     // NOTE: this->local_devices_ owns the device objects;
     // this->devices_ contains borrowed pointers to the device
@@ -178,7 +185,7 @@ class SimplePlacerTest : public ::testing::Test {
   //
   // REQUIRES: "*graph" was produced by the most recent call to BuildGraph.
   Status Place(Graph* graph, DeviceSet* devices, SessionOptions* options) {
-    SimplePlacer placer(graph, devices, &nodes_by_name_, options);
+    SimplePlacer placer(graph, devices, options);
     return placer.Run();
   }
 
@@ -215,6 +222,13 @@ class SimplePlacerTest : public ::testing::Test {
   do {                                                              \
     Graph& g_ = (g);                                                \
     EXPECT_EQ(GetNodeByName(g_, (name_a))->assigned_device_name(),  \
+              GetNodeByName(g_, (name_b))->assigned_device_name()); \
+  } while (0)
+
+#define EXPECT_NOT_COLOCATED(g, name_a, name_b)                     \
+  do {                                                              \
+    Graph& g_ = (g);                                                \
+    EXPECT_NE(GetNodeByName(g_, (name_a))->assigned_device_name(),  \
               GetNodeByName(g_, (name_b))->assigned_device_name()); \
   } while (0)
 
@@ -409,68 +423,225 @@ TEST_F(SimplePlacerTest, TestReferenceConnection) {
   TF_EXPECT_OK(ReferenceTestHelper("VariableGPU", "AssignGPU", DEVICE_GPU));
 }
 
-// Test the handling of '@node_name' colocation constraints, when
-// these are arranged in multiple chains.
-TEST_F(SimplePlacerTest, TestColocatedChain) {
+// Test that an assignment of an operator to the wrong device
+// is ignored when it could never be satisfied (due to reference
+// edges, for example).
+TEST_F(SimplePlacerTest, TestReferenceConnectionIgnoreInfeasible) {
+  Status s;
   Graph g(OpRegistry::Global());
-  {  // Scope for temporary variables used to construct g.
+  {
     GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
-    Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
-    Node* last_node = input;
-    for (int i = 0; i < 100; ++i) {
-      if (i % 10 == 0) {
-        // Every ten nodes, start a new chain.
-        last_node = ops::UnaryOp("TestRelu", last_node,
-                                 b.opts().WithName(strings::StrCat("n_", i)));
-      } else {
-        // Chain each successive node to the previous one.
-        last_node =
-            ops::UnaryOp("TestRelu", last_node,
-                         b.opts()
-                             .WithName(strings::StrCat("n_", i))
-                             .WithDevice(strings::StrCat("@n_", i - 1)));
-      }
-    }
+    Node* input = ops::SourceOp(
+        "TestDevice",
+        b.opts().WithName("in").WithDevice("/job:a/task:0/device:GPU:0"));
+    Node* var = ops::SourceOp(
+        "TestVariable",
+        b.opts().WithName("var_0").WithDevice("/job:a/task:0/device:GPU:0"));
+
+    // This op is specified on CPU, but in practice will be ignored,
+    // because the reference edges forces it on GPU.
+    ops::BinaryOp(
+        "TestAssign", var, input,
+        b.opts().WithName("assign").WithDevice("/job:a/task:0/device:CPU:0"));
     TF_EXPECT_OK(BuildGraph(b, &g));
   }
 
-  TF_EXPECT_OK(Place(&g));
-  for (int i = 0; i < 100; ++i) {
-    if (i % 10 != 0) {
-      EXPECT_COLOCATED(g, strings::StrCat("n_", i - (i % 1)),
-                       strings::StrCat("n_", i));
-    }
-  }
+  SessionOptions options;
+  s = Place(&g, &options);
+  TF_EXPECT_OK(s);
+  EXPECT_DEVICE_TYPE(g, "var_0", DEVICE_GPU);
+  EXPECT_DEVICE_TYPE(g, "assign", DEVICE_GPU);
 }
 
-// Test the handling of '@node_name' colocation constraints, when the
-// chains are shuffled.
-TEST_F(SimplePlacerTest, TestColocatedChainWithLongRangeColocations) {
+// Test that an assignment of an operator to the a more specified device
+// causes the device to maintain its more specific placement.
+TEST_F(SimplePlacerTest,
+       TestReferenceConnectionMoreSpecificDestinationSourceWins) {
+  Status s;
+  Graph g(OpRegistry::Global());
+  {
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    // Input can be on either device
+    Node* input =
+        ops::SourceOp("TestCPUGPUOutput",
+                      b.opts().WithName("in").WithDevice("/job:a/task:0"));
+
+    // Variable can be on either device
+    Node* var = ops::SourceOp(
+        "TestVariable", b.opts().WithName("var_0").WithDevice("/job:a/task:0"));
+
+    // This op is specified on CPU and is more specific than the variable.
+    // Because the variable is less specified, the variable will be
+    // assigned to CPU.
+    ops::BinaryOp(
+        "TestAssign", var, input,
+        b.opts().WithName("assign").WithDevice("/job:a/task:0/device:CPU:0"));
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  SessionOptions options;
+  s = Place(&g, &options);
+  TF_EXPECT_OK(s);
+  EXPECT_DEVICE_TYPE(g, "var_0", DEVICE_CPU);
+  EXPECT_DEVICE_TYPE(g, "assign", DEVICE_CPU);
+}
+
+// A reference connection exists between a variable and an assign,
+// where the assign has a device but the variable does not.  In this
+// case, the variable gets placed on the location of the assign
+// operation.
+TEST_F(SimplePlacerTest, TestReferenceConnectionNoSourceDevice) {
+  Status s;
+  Graph g(OpRegistry::Global());
+  {
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    Node* input = ops::SourceOp(
+        "TestDevice",
+        b.opts().WithName("in").WithDevice("/job:a/task:0/device:GPU:0"));
+    Node* var = ops::SourceOp("TestVariable", b.opts().WithName("var_0"));
+    ops::BinaryOp(
+        "TestAssign", var, input,
+        b.opts().WithName("assign").WithDevice("/job:a/task:0/device:CPU:0"));
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  SessionOptions options;
+  s = Place(&g, &options);
+  TF_EXPECT_OK(s);
+  EXPECT_DEVICE_TYPE(g, "var_0", DEVICE_CPU);
+  EXPECT_DEVICE_TYPE(g, "assign", DEVICE_CPU);
+}
+
+TEST_F(SimplePlacerTest, TestColocationGroup) {
   Graph g(OpRegistry::Global());
   {  // Scope for temporary variables used to construct g.
     GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
     Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
-    Node* last_node = input;
-    for (int i = 0; i < 10; ++i) {
-      // Start ten chains.
-      last_node = ops::UnaryOp("TestRelu", last_node,
-                               b.opts().WithName(strings::StrCat("n_", i)));
-    }
-    for (int i = 10; i < 100; ++i) {
-      // Add each node to the (i % 10)^th chain.
-      last_node = ops::UnaryOp("TestRelu", last_node,
-                               b.opts()
-                                   .WithName(strings::StrCat("n_", i))
-                                   .WithDevice(strings::StrCat("@n_", i % 10)));
-    }
+    Node* colocated_with_input = ops::UnaryOp(
+        "TestRelu", input,
+        b.opts().WithName("colocated_1").WithAttr("_class", {"loc:@in"}));
+
+    // This will not be colocated with the input because TestInput is
+    // only availbale on CPU and TestRelu will default to GPU.
+    Node* not_colocated_with_input =
+        ops::UnaryOp("TestRelu", input, b.opts().WithName("foo"));
+    CHECK(colocated_with_input);
+    CHECK(not_colocated_with_input);
     TF_EXPECT_OK(BuildGraph(b, &g));
   }
 
   TF_EXPECT_OK(Place(&g));
-  for (int i = 10; i < 100; ++i) {
-    EXPECT_COLOCATED(g, strings::StrCat("n_", i % 10),
-                     strings::StrCat("n_", i));
+  EXPECT_COLOCATED(g, "in", "colocated_1");
+  EXPECT_NOT_COLOCATED(g, "in", "foo");
+}
+
+TEST_F(SimplePlacerTest, TestMultipleColocationGroups) {
+  Graph g(OpRegistry::Global());
+  {  // Scope for temporary variables used to construct g.
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
+    Node* colocated_with_input = ops::UnaryOp(
+        "TestRelu", input,
+        b.opts().WithName("colocated_1").WithAttr("_class", {"loc:@in"}));
+    Node* colocated_with_input_and_other = ops::UnaryOp(
+        "TestRelu", input, b.opts().WithName("foo").WithAttr(
+                               "_class", {"loc:@in", "loc:@colocated_1"}));
+    CHECK(colocated_with_input);
+    CHECK(colocated_with_input_and_other);
+    TF_EXPECT_OK(BuildGraph(b, &g));
   }
+
+  TF_EXPECT_OK(Place(&g));
+  EXPECT_COLOCATED(g, "in", "colocated_1");
+  EXPECT_COLOCATED(g, "in", "foo");
+}
+
+TEST_F(SimplePlacerTest, TestInvalidMultipleColocationGroups) {
+  Graph g(OpRegistry::Global());
+  {  // Scope for temporary variables used to construct g.
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
+    Node* colocated_with_input = ops::UnaryOp(
+        "ReluCPU", input,
+        b.opts().WithName("colocated_1").WithAttr("_class", {"loc:@in"}));
+    Node* colocated_with_input_and_other = ops::UnaryOp(
+        "ReluGPU", input, b.opts().WithName("foo").WithAttr(
+                              "_class", {"loc:@in", "loc:@colocated_1"}));
+    CHECK(colocated_with_input);
+    CHECK(colocated_with_input_and_other);
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  Status s = Place(&g);
+  EXPECT_TRUE(StringPiece(s.error_message())
+                  .contains("Cannot colocate nodes 'foo' and 'in' because no "
+                            "device type supports both of those nodes and the "
+                            "other nodes colocated with them"));
+}
+
+TEST_F(SimplePlacerTest, TestColocationGroupWithReferenceConnections) {
+  Graph g(OpRegistry::Global());
+  {  // Scope for temporary variables used to construct g.
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
+    Node* var1 = ops::SourceOp("VariableCPU", b.opts().WithName("var1"));
+    Node* var2 = ops::SourceOp("VariableCPU", b.opts().WithName("var2"));
+
+    // Two assigns (reference connections) with two different
+    // colocation groups. Because their colocation groups all map to the
+    // same device, this is a valid assignment.
+    ops::BinaryOp(
+        "TestAssign", var1, input,
+        b.opts().WithName("assign1").WithAttr("_class", {"loc:@var1"}));
+    ops::BinaryOp(
+        "TestAssign", var2, input,
+        b.opts().WithName("assign2").WithAttr("_class", {"loc:@var2"}));
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  TF_EXPECT_OK(Place(&g));
+  EXPECT_COLOCATED(g, "in", "var1");
+  EXPECT_COLOCATED(g, "in", "var2");
+  EXPECT_COLOCATED(g, "var1", "assign2");
+  EXPECT_COLOCATED(g, "var2", "assign1");
+}
+
+TEST_F(SimplePlacerTest,
+       TestColocationGroupWithUnsatisfiableReferenceConnections) {
+  Graph g(OpRegistry::Global());
+  {  // Scope for temporary variables used to construct g.
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    Node* input = ops::SourceOp("TestInput", b.opts().WithName("in"));
+
+    Node* var1 = ops::SourceOp("VariableCPU", b.opts().WithName("var1"));
+    Node* var2 = ops::SourceOp("VariableCPU", b.opts().WithName("var2"));
+    // Var 3 is on GPU
+    Node* var3 = ops::SourceOp("VariableGPU", b.opts().WithName("var3"));
+
+    // Two assigns (reference connections) with two different
+    // colocation groups. Because their colocation groups all map to the
+    // same device, this is a valid assignment.
+    ops::BinaryOp(
+        "TestAssign", var1, input,
+        b.opts().WithName("assign1").WithAttr("_class", {"loc:@var1"}));
+    ops::BinaryOp(
+        "TestAssign", var2, input,
+        b.opts().WithName("assign2").WithAttr("_class", {"loc:@var2"}));
+    // Assign to var3, but try to use a colocation group that matches
+    // the assign of var2.  This should fail because assign2 must be on CPU
+    // (it has a reference edge on var2), and assign3 must be on GPU,
+    // hence the conflict.
+    ops::BinaryOp(
+        "TestAssign", var3, input,
+        b.opts().WithName("assign3").WithAttr("_class", {"loc:@var2"}));
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  Status s = Place(&g);
+  EXPECT_TRUE(
+      StringPiece(s.error_message())
+          .contains("Cannot assign a device to node 'var3': Node had no "
+                    "OpKernel registered"));
 }
 
 TEST_F(SimplePlacerTest, TestColocationAndReferenceConnections) {
@@ -489,13 +660,15 @@ TEST_F(SimplePlacerTest, TestColocationAndReferenceConnections) {
       // Create a variable colocated with some existing variable, and
       // an assignment colocated with a possibly-different variable.
       Node* var = ops::SourceOp(
-          "TestVariable", b.opts()
-                              .WithName(strings::StrCat("var_", i))
-                              .WithDevice(strings::StrCat("@var_", i % 6)));
-      ops::BinaryOp("TestAssign", var, input,
-                    b.opts()
-                        .WithName(strings::StrCat("assign_", i))
-                        .WithDevice(strings::StrCat("@assign_", i % 3)));
+          "TestVariable",
+          b.opts()
+              .WithName(strings::StrCat("var_", i))
+              .WithAttr("_class", {strings::StrCat("loc:@var_", i % 6)}));
+      ops::BinaryOp(
+          "TestAssign", var, input,
+          b.opts()
+              .WithName(strings::StrCat("assign_", i))
+              .WithAttr("_class", {strings::StrCat("loc:@assign_", i % 3)}));
     }
     TF_EXPECT_OK(BuildGraph(b, &g));
   }
@@ -703,37 +876,6 @@ TEST_F(SimplePlacerTest, TestNonUniqueAssignedDevice) {
           .contains("Assigned device '/job:a' does not match any device"));
 }
 
-// Test that placement fails when a node requests colocation with another
-// node that does not exist.
-TEST_F(SimplePlacerTest, TestUnknownColocatedNode) {
-  Graph g(OpRegistry::Global());
-  {  // Scope for temporary variables used to construct g.
-    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
-    ops::SourceOp("TestInput", b.opts().WithName("in").WithDevice("@foo"));
-    TF_EXPECT_OK(BuildGraph(b, &g));
-  }
-
-  Status s = Place(&g);
-  EXPECT_EQ(error::INVALID_ARGUMENT, s.code());
-  EXPECT_TRUE(StringPiece(s.error_message()).contains("'foo' does not exist"));
-}
-
-// Test that placement fails when a node requests colocation with a
-// malformed node name.
-TEST_F(SimplePlacerTest, TestMalformedColocatedNode) {
-  Graph g(OpRegistry::Global());
-  {  // Scope for temporary variables used to construct g.
-    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
-    ops::SourceOp("TestInput", b.opts().WithName("in").WithDevice("@"));
-    TF_EXPECT_OK(BuildGraph(b, &g));
-  }
-
-  Status s = Place(&g);
-  EXPECT_EQ(error::INVALID_ARGUMENT, s.code());
-  EXPECT_TRUE(StringPiece(s.error_message())
-                  .contains("node named in device '' does not exist"));
-}
-
 // Test that ops request to be placed on non-existent devices will be relocated
 // to existing device of the same type if allow_soft_placement is set.
 TEST_F(SimplePlacerTest, TestNonexistentGpuAllowSoftPlacement) {
@@ -786,6 +928,32 @@ TEST_F(SimplePlacerTest, TestUnsupportedDeviceNoAllowSoftPlacement) {
       StringPiece(s.error_message())
           .contains(
               "Could not satisfy explicit device specification '/cpu:0'"));
+  EXPECT_TRUE(
+      StringPiece(s.error_message())
+          .contains("no supported kernel for CPU devices is available"));
+}
+
+// Test that placement fails when a node requests an explicit device that is not
+// supported by the registered kernels if allow_soft_placement is no set.
+TEST_F(SimplePlacerTest, TestNonExistentDevice) {
+  Graph g(OpRegistry::Global());
+  {  // Scope for temporary variables used to construct g.
+    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
+    ops::SourceOp("VariableGPU",
+                  b.opts().WithName("var").WithDevice("/job:foo/replica:17"));
+    TF_EXPECT_OK(BuildGraph(b, &g));
+  }
+
+  SessionOptions options;
+  Status s = Place(&g, &options);
+  EXPECT_EQ(error::INVALID_ARGUMENT, s.code());
+  LOG(WARNING) << s.error_message();
+  EXPECT_TRUE(
+      StringPiece(s.error_message())
+          .contains("Could not satisfy explicit device specification "
+                    "'/job:foo/replica:17' "
+                    "because no devices matching that specification are "
+                    "registered in this process"));
 }
 
 TEST_F(SimplePlacerTest, TestUnsupportedDeviceAllowSoftPlacement) {
@@ -850,28 +1018,6 @@ TEST_F(SimplePlacerTest, TestUnsatisfiableConstraintWithReferenceConnections) {
   EXPECT_EQ(error::INVALID_ARGUMENT, s.code());
   EXPECT_TRUE(StringPiece(s.error_message())
                   .contains("Cannot colocate nodes 'var' and 'assign'"));
-}
-
-// Test that placement fails when two nodes have an explicit
-// colocation constraint, and each node requires a mutually
-// incompatible device.
-TEST_F(SimplePlacerTest, TestUnsatisfiableConstraintWithColocatedNodes) {
-  Graph g(OpRegistry::Global());
-  {  // Scope for temporary variables used to construct g.
-    GraphDefBuilder b(GraphDefBuilder::kFailImmediately);
-    Node* input = ops::SourceOp("TestInput",
-                                b.opts().WithName("in").WithDevice("/gpu:0"));
-    Node* relu_1 = ops::UnaryOp("TestRelu", input,
-                                b.opts().WithName("relu_1").WithDevice("@in"));
-    ops::UnaryOp("ReluGPU", relu_1,
-                 b.opts().WithName("relu_2").WithDevice("@relu_1"));
-    TF_EXPECT_OK(BuildGraph(b, &g));
-  }
-
-  Status s = Place(&g);
-  EXPECT_EQ(error::INVALID_ARGUMENT, s.code());
-  EXPECT_TRUE(StringPiece(s.error_message())
-                  .contains("Cannot colocate nodes 'relu_1' and 'relu_2'"));
 }
 
 }  // namespace

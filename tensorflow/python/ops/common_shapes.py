@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 """A library of common shape functions."""
 from __future__ import absolute_import
 from __future__ import division
@@ -41,8 +40,10 @@ def unchanged_shape_with_rank(rank):
     A shape function for ops that output a tensor of the same size as their
     input, with a particular rank.
   """
+
   def _ShapeFunction(op):
     return [op.inputs[0].get_shape().with_rank(rank)]
+
   return _ShapeFunction
 
 
@@ -56,8 +57,10 @@ def unchanged_shape_with_rank_at_least(rank):
     A shape function for ops that output a tensor of the same size as their
     input, with a particular rank.
   """
+
   def _ShapeFunction(op):
     return [op.inputs[0].get_shape().with_rank_at_least(rank)]
+
   return _ShapeFunction
 
 
@@ -71,8 +74,10 @@ def unchanged_shape_with_rank_at_most(rank):
     A shape function for ops that output a tensor of the same size as their
     input, with a particular rank.
   """
+
   def _ShapeFunction(op):
     return [op.inputs[0].get_shape().with_rank_at_most(rank)]
+
   return _ShapeFunction
 
 
@@ -96,59 +101,87 @@ def bias_add_shape(op):
   bias_shape = op.inputs[1].get_shape().with_rank(1)
   if input_shape.ndims is not None:
     # Output has the same shape as input, and matches the length of
-    # bias in its last dimension.
-    output_shape = input_shape[0:-1].concatenate(
-        input_shape[-1].merge_with(bias_shape[0]))
+    # bias in its bias dimension.
+    try:
+      data_format = op.get_attr("data_format")
+    except ValueError:
+      data_format = None
+    if data_format == b"NCHW":
+      # Merge the length of bias_shape into the third-to-last dimension.
+      output_shape = input_shape[0:-3].concatenate(input_shape[-3].merge_with(
+          bias_shape[0])).concatenate(input_shape[-2:])
+    else:
+      output_shape = input_shape[0:-1].concatenate(input_shape[-1].merge_with(
+          bias_shape[0]))
   else:
     output_shape = tensor_shape.unknown_shape()
   return [output_shape]
 
 
+def bias_add_grad_shape(op):
+  """Shape function for a BiasAddGrad op."""
+  input_shape = op.inputs[0].get_shape().with_rank_at_least(2)
+  try:
+    data_format = op.get_attr("data_format")
+  except ValueError:
+    data_format = None
+
+  if data_format == b"NCHW":
+    output_shape = input_shape[-3]
+  else:
+    output_shape = input_shape[-1]
+
+  return [output_shape]
+
+
+def get_conv_output_size(input_size, filter_size, strides, padding_type):
+  """Returns the spatial size of a n-d convolution/pooling output."""
+  input_size = tuple([tensor_shape.as_dimension(x).value for x in input_size])
+  filter_size = tuple([tensor_shape.as_dimension(x).value for x in filter_size])
+  strides = [int(x) for x in strides]
+
+  if all(x == 1 for x in input_size) and all(x == 1 for x in filter_size):
+    return input_size
+
+  if any(x is not None and y is not None and x > y for x, y in
+         zip(filter_size, input_size)):
+    raise ValueError("Filter must not be larger than the input: "
+                     "Filter: %r Input: %r" % (filter_size, input_size))
+
+  if padding_type == b"VALID":
+
+    def _valid(in_dim, k_dim, s_dim):
+      if in_dim is not None and k_dim is not None:
+        return (in_dim - k_dim + s_dim) // s_dim
+      else:
+        return None
+
+    output_size = [
+        _valid(in_dim, k_dim, s_dim)
+        for in_dim, k_dim, s_dim in zip(input_size, filter_size, strides)
+    ]
+  elif padding_type == b"SAME":
+
+    def _same(in_dim, s_dim):
+      if in_dim is not None:
+        return (in_dim + s_dim - 1) // s_dim
+      else:
+        return None
+
+    output_size = [_same(in_dim, s_dim)
+                   for in_dim, s_dim in zip(input_size, strides)]
+  else:
+    raise ValueError("Invalid padding: %r" % padding_type)
+
+  return tuple(output_size)
+
+
 def get2d_conv_output_size(input_height, input_width, filter_height,
                            filter_width, row_stride, col_stride, padding_type):
   """Returns the number of rows and columns in a convolution/pooling output."""
-  input_height = tensor_shape.as_dimension(input_height)
-  input_width = tensor_shape.as_dimension(input_width)
-  filter_height = tensor_shape.as_dimension(filter_height)
-  filter_width = tensor_shape.as_dimension(filter_width)
-  row_stride = int(row_stride)
-  col_stride = int(col_stride)
-
-  if filter_height.value == 1 and filter_width.value == 1 and (
-      row_stride == 1 and col_stride == 1):
-    return input_height, input_width
-  else:
-    if filter_height > input_height or filter_width > input_width:
-      raise ValueError(
-          "filter must not be larger than the input: "
-          "Filter: [%sx%s] Input: [%sx%s]"
-          % (filter_height, filter_width, input_height, input_width))
-    if row_stride > filter_height or col_stride > filter_width:
-      raise ValueError("stride must be less than or equal to filter size",
-                       "stride: [%sx%s] filter: [%sx%s]"
-                       % (row_stride, col_stride, filter_height, filter_width))
-
-    # Compute number of rows in the output, based on the padding.
-    if input_height.value is None or filter_height.value is None:
-      out_rows = None
-    elif padding_type == b"VALID":
-      out_rows = ((input_height.value - filter_height.value + row_stride) //
-                  row_stride)
-    elif padding_type == b"SAME":
-      out_rows = (input_height.value + row_stride - 1) // row_stride
-    else:
-      raise ValueError("Invalid value for padding: %r" % padding_type)
-
-    # Compute number of columns in the output, based on the padding.
-    if input_width.value is None or filter_width.value is None:
-      out_cols = None
-    elif padding_type == b"VALID":
-      out_cols = ((input_width.value - filter_width.value + col_stride) //
-                  col_stride)
-    elif padding_type == b"SAME":
-      out_cols = (input_width.value + col_stride - 1) // col_stride
-
-    return out_rows, out_cols
+  return get_conv_output_size((input_height, input_width),
+                              (filter_height, filter_width),
+                              (row_stride, col_stride), padding_type)
 
 
 def conv2d_shape(op):
@@ -176,6 +209,16 @@ def conv2d_shape(op):
   input_shape = op.inputs[0].get_shape().with_rank(4)
   filter_shape = op.inputs[1].get_shape().with_rank(4)
 
+  try:
+    data_format = op.get_attr("data_format")
+  except ValueError:
+    data_format = None
+
+  if data_format == b"NCHW":
+    # Convert input shape to the dfeault NHWC for inference.
+    input_shape = [input_shape[0], input_shape[2], input_shape[3],
+                   input_shape[1]]
+
   batch_size = input_shape[0]
   in_rows = input_shape[1]
   in_cols = input_shape[2]
@@ -183,6 +226,65 @@ def conv2d_shape(op):
   filter_rows = filter_shape[0]
   filter_cols = filter_shape[1]
   depth_out = filter_shape[3]
+  # Check that the input depths are compatible.
+  input_shape[3].assert_is_compatible_with(filter_shape[2])
+
+  if data_format == b"NCHW":
+    stride_b, stride_d, stride_r, stride_c = op.get_attr("strides")
+  else:
+    stride_b, stride_r, stride_c, stride_d = op.get_attr("strides")
+
+  if stride_b != 1 or stride_d != 1:
+    raise ValueError("Current implementation does not yet support "
+                     "strides in the batch and depth dimensions.")
+  # TODO(mrry,shlens): Raise an error if the stride would cause
+  # information in the input to be ignored. This will require a change
+  # in the kernel implementation.
+  padding = op.get_attr("padding")
+  out_rows, out_cols = get2d_conv_output_size(in_rows, in_cols, filter_rows,
+                                              filter_cols, stride_r, stride_c,
+                                              padding)
+
+  output_shape = [batch_size, out_rows, out_cols, depth_out]
+  if data_format == b"NCHW":
+    # Convert output shape back to NCHW.
+    output_shape = [output_shape[0], output_shape[3], output_shape[1],
+                    output_shape[2]]
+  return [tensor_shape.TensorShape(output_shape)]
+
+
+def depthwise_conv2d_native_shape(op):
+  """Shape function for a DepthwiseConv2D op.
+
+  This op has two inputs:
+
+  * input, a 4D tensor with shape = [batch_size, rows, cols, depth_in]
+  * filter, a 4D tensor with shape =  [filter_rows, filter_cols,
+    depth_in, depthwise_multiplier]
+
+  The output is a 4D tensor with shape = [batch_size, out_rows,
+  out_cols, depth_in*depthwise_multiplier], where out_rows and out_cols depend
+  on the value of the op's "padding" and "strides" attrs.
+
+  Args:
+    op: A DepthwiseConv2dNative Operation.
+
+  Returns:
+    A list containing the Shape of the DepthwiseConv2DNative output.
+
+  Raises:
+    ValueError: If the shapes of the input or filter are incompatible.
+  """
+  input_shape = op.inputs[0].get_shape().with_rank(4)
+  filter_shape = op.inputs[1].get_shape().with_rank(4)
+
+  batch_size = input_shape[0]
+  in_rows = input_shape[1]
+  in_cols = input_shape[2]
+
+  filter_rows = filter_shape[0]
+  filter_cols = filter_shape[1]
+  depth_out = filter_shape[3] * filter_shape[2]
   # Check that the input depths are compatible.
   input_shape[3].assert_is_compatible_with(filter_shape[2])
 
@@ -200,8 +302,9 @@ def conv2d_shape(op):
   # in the kernel implementation.
   stride = stride_r
   padding = op.get_attr("padding")
-  out_rows, out_cols = get2d_conv_output_size(
-      in_rows, in_cols, filter_rows, filter_cols, stride, stride, padding)
+  out_rows, out_cols = get2d_conv_output_size(in_rows, in_cols, filter_rows,
+                                              filter_cols, stride, stride,
+                                              padding)
 
   return [tensor_shape.TensorShape([batch_size, out_rows, out_cols, depth_out])]
 
@@ -262,8 +365,9 @@ def separable_conv2d_shape(op):
   # in the kernel implementation.
   stride = stride_r
   padding = op.get_attr("padding")
-  out_rows, out_cols = get2d_conv_output_size(
-      in_rows, in_cols, filter_rows, filter_cols, stride, stride, padding)
+  out_rows, out_cols = get2d_conv_output_size(in_rows, in_cols, filter_rows,
+                                              filter_cols, stride, stride,
+                                              padding)
 
   return [tensor_shape.TensorShape([batch_size, out_rows, out_cols, depth_out])]
 
@@ -290,8 +394,22 @@ def avg_pool_shape(op):
       the values of the attrs.
   """
   input_shape = op.inputs[0].get_shape().with_rank(4)
-  ksize_b, ksize_r, ksize_c, ksize_d = op.get_attr("ksize")
-  stride_b, stride_r, stride_c, stride_d = op.get_attr("strides")
+  try:
+    data_format = op.get_attr("data_format")
+  except ValueError:
+    data_format = None
+
+  if data_format == b"NCHW":
+    # Convert input shape to the dfeault NHWC for inference.
+    input_shape = [input_shape[0], input_shape[2], input_shape[3],
+                   input_shape[1]]
+
+  if data_format == b"NCHW":
+    ksize_b, ksize_d, ksize_r, ksize_c = op.get_attr("ksize")
+    stride_b, stride_d, stride_r, stride_c = op.get_attr("strides")
+  else:
+    ksize_b, ksize_r, ksize_c, ksize_d = op.get_attr("ksize")
+    stride_b, stride_r, stride_c, stride_d = op.get_attr("strides")
 
   batch_size = input_shape[0]
   in_rows = input_shape[1]
@@ -310,10 +428,16 @@ def avg_pool_shape(op):
   # in the kernel implementation.
   padding = op.get_attr("padding")
 
-  out_rows, out_cols = get2d_conv_output_size(
-      in_rows, in_cols, ksize_r, ksize_c, stride_r, stride_c, padding)
+  out_rows, out_cols = get2d_conv_output_size(in_rows, in_cols, ksize_r,
+                                              ksize_c, stride_r, stride_c,
+                                              padding)
 
-  return [tensor_shape.TensorShape([batch_size, out_rows, out_cols, depth])]
+  output_shape = [batch_size, out_rows, out_cols, depth]
+  if data_format == b"NCHW":
+    # Convert output shape back to NCHW.
+    output_shape = [output_shape[0], output_shape[3], output_shape[1],
+                    output_shape[2]]
+  return [tensor_shape.TensorShape(output_shape)]
 
 
 def max_pool_shape(op):
@@ -338,8 +462,22 @@ def max_pool_shape(op):
       the values of the attrs.
   """
   input_shape = op.inputs[0].get_shape().with_rank(4)
-  ksize_b, ksize_r, ksize_c, ksize_d = op.get_attr("ksize")
-  stride_b, stride_r, stride_c, stride_d = op.get_attr("strides")
+  try:
+    data_format = op.get_attr("data_format")
+  except ValueError:
+    data_format = None
+
+  if data_format == b"NCHW":
+    # Convert input shape to the default NHWC for inference.
+    input_shape = [input_shape[0], input_shape[2], input_shape[3],
+                   input_shape[1]]
+
+  if data_format == b"NCHW":
+    ksize_b, ksize_d, ksize_r, ksize_c = op.get_attr("ksize")
+    stride_b, stride_d, stride_r, stride_c = op.get_attr("strides")
+  else:
+    ksize_b, ksize_r, ksize_c, ksize_d = op.get_attr("ksize")
+    stride_b, stride_r, stride_c, stride_d = op.get_attr("strides")
 
   batch_size = input_shape[0]
   in_rows = input_shape[1]
@@ -362,9 +500,10 @@ def max_pool_shape(op):
   # in the kernel implementation.
   if ksize_d == 1:
     padding = op.get_attr("padding")
-    out_rows, out_cols = get2d_conv_output_size(
-        in_rows, in_cols, ksize_r, ksize_c, stride_r, stride_c, padding)
-    return [tensor_shape.TensorShape([batch_size, out_rows, out_cols, depth])]
+    out_rows, out_cols = get2d_conv_output_size(in_rows, in_cols, ksize_r,
+                                                ksize_c, stride_r, stride_c,
+                                                padding)
+    output_shape = [batch_size, out_rows, out_cols, depth]
   else:
     if depth % ksize_d > 0:
       raise ValueError("Depthwise max pooling requires the depth window "
@@ -372,8 +511,13 @@ def max_pool_shape(op):
     if stride_d != ksize_d:
       raise ValueError("Depthwise max pooling requires the depth window "
                        "to equal the depth stride.")
-    return [tensor_shape.TensorShape([batch_size, in_rows, in_cols, depth //
-                                      ksize_d])]
+    output_shape = [batch_size, in_rows, in_cols, depth // ksize_d]
+
+  if data_format == b"NCHW":
+    # Convert output shape back to NCHW.
+    output_shape = [output_shape[0], output_shape[3], output_shape[1],
+                    output_shape[2]]
+  return [tensor_shape.TensorShape(output_shape)]
 
 
 def no_outputs(unused_op):

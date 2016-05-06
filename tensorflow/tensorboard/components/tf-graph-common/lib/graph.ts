@@ -1,28 +1,33 @@
 /* Copyright 2015 Google Inc. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
+Licensed under the Apache License, Version 2.0 (the 'License');
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
+distributed under the License is distributed on an 'AS IS' BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-
-/// <reference path="../../../typings/tsd.d.ts" />
-/// <reference path="common.ts" />
 module tf.graph {
 
 /** Delimiter used in node names to denote namespaces. */
-export const NAMESPACE_DELIM = "/";
-export const ROOT_NAME = "__root__";
+export const NAMESPACE_DELIM = '/';
+export const ROOT_NAME = '__root__';
+
+/** Attribute key used for storing attributes that are too large. */
+export const LARGE_ATTRS_KEY = '_too_large_attrs';
+/**
+ * Maximum allowed size in bytes, before the attribute is considered large
+ * and filtered out of the graph.
+ */
+export const LIMIT_ATTR_SIZE = 1024;
 
 // Separator between the source and the destination name of the edge.
-export const EDGE_KEY_DELIM = "--";
+export const EDGE_KEY_DELIM = '--';
 
 export enum GraphType {FULL, EMBEDDED, META, SERIES, CORE, SHADOW, BRIDGE,
     EDGE};
@@ -30,6 +35,12 @@ export enum NodeType {META, OP, SERIES, BRIDGE, ELLIPSIS};
 
 /** Indicates if a node is to be included in the main graph when rendered. */
 export enum InclusionType {INCLUDE, EXCLUDE, UNSPECIFIED};
+
+/** Indicates if a series is to be grouped in the graph when rendered. */
+export enum SeriesGroupingType {GROUP, UNGROUP};
+
+/** Attribute key reserved for the shapes of the output tensors. */
+const OUTPUT_SHAPES_KEY = '_output_shapes';
 
 /**
  * A BaseEdge is the label object (in the graphlib sense) for an edge in the
@@ -108,13 +119,31 @@ export interface Node {
   include: InclusionType;
 }
 
+export type TensorShape = number[];
+
 export interface OpNode extends Node {
   op: string;
   device: string;
-  attr: {key: string, value: Object}[];
+  attr: {key: string, value: any}[];
   inputs: NormalizedInput[];
   inEmbeddings: OpNode[];
   outEmbeddings: OpNode[];
+  // The name of the SeriesNode that can contain this node in its series.
+  // If there is no such node, then this is null.
+  owningSeries: string;
+  /**
+   * Array of tensor shapes. Null if the number of output tensors is unknown,
+   * otherwise the length will equal the number of output tensors.
+   *
+   * Each tensor shape is an array of numbers, or null. Details:
+   * - null means unknown rank, and therefore entire shape is unknown.
+   * - [4, 2, 1] means rank-3 tensor of size 4x2x1.
+   * - [] means a scalar (rank-0 tensor).
+   * - [1] means rank-1 tensor of size 1 (not the same as scalar).
+   * - [5, -1, 3] means rank-3 tensor of shape is 5x?x3. The size
+   *       of the middle dimension is unknown (encoded as -1).
+   */
+  outputShapes: TensorShape[];
 }
 
 export interface BridgeNode extends Node {
@@ -285,7 +314,7 @@ export class EllipsisNodeImpl implements EllipsisNode {
 
   setNumMoreNodes(numNodes: number) {
     this.numMoreNodes = numNodes;
-    this.name = "... " + numNodes + " more";
+    this.name = '... ' + numNodes + ' more';
   }
 };
 
@@ -298,7 +327,7 @@ class OpNodeImpl implements OpNode {
   op: string;
   device: string;
   stats: NodeStats;
-  attr: {key: string, value: Object}[];
+  attr: {key: string, value: any}[];
   inputs: NormalizedInput[];
   type: NodeType;
   isGroupNode: boolean;
@@ -307,22 +336,25 @@ class OpNodeImpl implements OpNode {
   outEmbeddings: OpNode[];
   parentNode: Node;
   include: InclusionType;
+  owningSeries: string;
+  outputShapes: TensorShape[];
 
   /**
    * Constructs a new Op node.
    *
    * @param rawNode The raw node.
-   * @param normalizedInputs An array of normalized
-   *     inputs that denote the incoming edges to the current node. Each input
-   *     contains the normalized name of the source node, whether it has a
-   *     number part and whether it is a control dependency.
    */
-  constructor(rawNode: tf.TFNode, normalizedInputs: NormalizedInput[]) {
+  constructor(rawNode: tf.TFNode) {
     this.op = rawNode.op;
     this.name = rawNode.name;
     this.device = rawNode.device;
     this.attr = rawNode.attr;
-    this.inputs = normalizedInputs;
+    // An array of normalized inputs that denote the incoming edges to
+    // the current node. Each input contains the normalized name of the
+    // source node, whether it has a number part and whether it is a
+    // control dependency.
+    this.inputs = normalizeInputs(rawNode.input);
+    this.outputShapes = extractOutputShapes(rawNode.attr);
     // additional properties
     this.type = NodeType.OP;
     this.isGroupNode = false;
@@ -331,6 +363,7 @@ class OpNodeImpl implements OpNode {
     this.outEmbeddings = [];
     this.parentNode = null;
     this.include = InclusionType.UNSPECIFIED;
+    this.owningSeries = null;
   }
 };
 
@@ -343,35 +376,57 @@ export function createMetanode(name: string, opt = {}): Metanode {
  * graph information.
  */
 export function joinStatsInfoWithGraph(graph: SlimGraph,
-    statsJson: TFStats): void {
-  _.each(statsJson.devStats, stats => {
-    _.each(stats.nodeStats, nodeStats => {
+    stats: StepStats): void {
+  _.each(stats.dev_stats, devStats => {
+    _.each(devStats.node_stats, nodeStats => {
       // Lookup the node in the graph by its original name, e.g. A. If not
       // found, lookup by the rewritten name A/(A) in case the name is both
       // a namespace and a node name.
-      let nodeName = nodeStats.nodeName in graph.nodes ?
-          nodeStats.nodeName :
-          nodeStats.nodeName + NAMESPACE_DELIM + "(" + nodeStats.nodeName + ")";
-      if (nodeName in graph.nodes) {
-        // Compute the total bytes used.
-        let totalBytes = 0;
-        if (nodeStats.memory) {
-          _.each(nodeStats.memory, alloc => {
-            if (alloc.totalBytes) {
-              totalBytes += Number(alloc.totalBytes);
-            }
-          });
-        }
-        let outputSize: number[][] = null;
-        if (nodeStats.output) {
-          outputSize = _.map(nodeStats.output, output => {
-            return _.map(output.tensorDescription.shape.dim,
-                dim => Number(dim.size));
-          });
-        }
-        graph.nodes[nodeName].stats = new NodeStats(totalBytes,
-            Number(nodeStats.allEndRelMicros), outputSize);
+      let nodeName = nodeStats.node_name in graph.nodes ? nodeStats.node_name :
+                                                          nodeStats.node_name +
+              NAMESPACE_DELIM + '(' + nodeStats.node_name + ')';
+
+      // Couldn't find a matching node.
+      if (!(nodeName in graph.nodes)) {
+        return;
       }
+
+      // Compute the total bytes used.
+      let totalBytes = 0;
+      if (nodeStats.memory) {
+        _.each(nodeStats.memory, alloc => {
+        if (alloc.total_bytes) {
+            if (alloc.total_bytes > 0) {
+              totalBytes += Number(alloc.total_bytes);
+            } else {
+              /* tslint:disable */
+              console.log(
+                  'ignoring negative memory allocation for ' + nodeName);
+              /* tslint:enable */
+            }
+          }
+        });
+      }
+      let totalMicroSeconds = 0;
+      if (nodeStats.all_end_rel_micros) {
+        if (nodeStats.all_end_rel_micros > 0) {
+          totalMicroSeconds = Number(nodeStats.all_end_rel_micros);
+        } else {
+          /* tslint:disable */
+          console.log('ignoring negative runtime for ' + nodeName);
+          /* tslint:enable */
+        }
+      }
+      let outputSize: number[][] = null;
+      if (nodeStats.output) {
+        outputSize = _.map(nodeStats.output, output => {
+          return _.map(output.tensor_description.shape.dim,
+              dim => Number(dim.size));
+        });
+      }
+      graph.nodes[nodeName].device = devStats.device;
+      graph.nodes[nodeName].stats = new NodeStats(totalBytes,
+        totalMicroSeconds, outputSize);
     });
   });
 }
@@ -459,7 +514,6 @@ class MetanodeImpl implements Metanode {
     this.templateId = null;
     /** Metanode which contains this node, if any */
     this.parentNode = null;
-    this.stats = new NodeStats(0, 0, null);
     this.hasNonControlEdges = false;
     this.include = InclusionType.UNSPECIFIED;
   }
@@ -470,12 +524,12 @@ class MetanodeImpl implements Metanode {
 
   /**
    * Returns the op node associated with the metanode.
-   * For example, if the metanode is "sgd", the associated
+   * For example, if the metanode is 'sgd', the associated
    * op node is sgd/(sgd).
    */
   getRootOp(): OpNode {
-    let nameSplit = this.name.split("/");
-    let rootOpName = this.name + "/(" + nameSplit[nameSplit.length - 1] + ")";
+    let nameSplit = this.name.split('/');
+    let rootOpName = this.name + '/(' + nameSplit[nameSplit.length - 1] + ')';
     return <OpNode>this.metagraph.node(rootOpName);
   }
 
@@ -540,7 +594,12 @@ export interface Metaedge extends graphlib.EdgeObject {
    */
   numRefEdges: number;
 
-  addBaseEdge(edge: BaseEdge): void;
+  /**
+   * Total size (number of units) of all the tensors flowing through this edge.
+   */
+  totalSize: number;
+
+  addBaseEdge(edge: BaseEdge, h: hierarchy.Hierarchy): void;
 }
 
 export function createMetaedge(v: string, w: string): Metaedge {
@@ -558,6 +617,7 @@ class MetaedgeImpl implements Metaedge {
   numRegularEdges: number;
   numControlEdges: number;
   numRefEdges: number;
+  totalSize: number;
 
   constructor(v: string, w: string) {
     this.v = v;
@@ -567,9 +627,10 @@ class MetaedgeImpl implements Metaedge {
     this.numRegularEdges = 0;
     this.numControlEdges = 0;
     this.numRefEdges = 0;
+    this.totalSize = 0;
   }
 
-  addBaseEdge(edge: BaseEdge): void {
+  addBaseEdge(edge: BaseEdge, h: hierarchy.Hierarchy): void {
     this.baseEdgeList.push(edge);
     if (edge.isControlDependency) {
       this.numControlEdges += 1;
@@ -579,6 +640,40 @@ class MetaedgeImpl implements Metaedge {
     if (edge.isReferenceEdge) {
       this.numRefEdges += 1;
     }
+    // Compute the size of the tensor flowing through this
+    // base edge.
+    this.totalSize += MetaedgeImpl.computeSizeOfEdge(edge, h);
+    h.maxMetaEdgeSize = Math.max(h.maxMetaEdgeSize, this.totalSize);
+  }
+
+  private static computeSizeOfEdge(edge: BaseEdge, h: hierarchy.Hierarchy):
+      number {
+    let opNode = <OpNode> h.node(edge.v);
+    if (opNode.outputShapes == null) {
+      // No shape information. Asssume a single number. This gives
+      // a lower bound for the total size.
+      return 1;
+    }
+    h.hasShapeInfo = true;
+    // Sum the sizes of all output tensors.
+    return _(opNode.outputShapes).map(shape => {
+      // If the shape is unknown, treat it as 1 when computing
+      // total size. This gives a lower bound for the total size.
+      if (shape == null) {
+        return 1;
+      }
+      // Multiply all shapes to get the total size of the tensor.
+      // E.g. The total size of [4, 2, 1] is 4 * 2 * 1.
+      return _(shape).reduce((accumulated, currSize) => {
+        // If this particular dimension is unknown, treat
+        // it as 1 when computing total size. This gives a lower bound
+        // for the total size.
+        if (currSize === -1) {
+          currSize = 1;
+        }
+        return accumulated * currSize;
+      }, 1);
+    }).sum();
   }
 }
 
@@ -590,10 +685,11 @@ export function createSeriesNode(prefix: string, suffix: string,
 export function getSeriesNodeName(prefix: string, suffix: string,
     parent: string, startId?: number, endId?: number): string {
   let numRepresentation =
-      (typeof startId !== "undefined" && typeof endId !== "undefined") ?
-      "[" + startId + "-" + endId + "]" : "#";
+      (typeof startId !== 'undefined' && typeof endId !== 'undefined') ?
+      '[' + startId + '-' + endId + ']' :
+      '#';
   let pattern = prefix + numRepresentation + suffix;
-  return (parent ? parent + "/" : "") + pattern;
+  return (parent ? parent + '/' : '') + pattern;
 }
 
 class SeriesNodeImpl implements SeriesNode {
@@ -633,9 +729,51 @@ class SeriesNodeImpl implements SeriesNode {
     this.parentNode = null;
     this.deviceHistogram = {};
     this.hasNonControlEdges = false;
-    this.stats = new NodeStats(0, 0, null);
     this.include = InclusionType.UNSPECIFIED;
   }
+}
+
+/**
+ * Extracts the shapes of the output tensors from the attr property in the
+ * node proto.
+ */
+function extractOutputShapes(attr: {key: string, value: any}[]): TensorShape[] {
+  let result = null;
+  // We don't know anything about the output tensors.
+  if (!attr) {
+    return null;
+  }
+  for (let i = 0; i < attr.length; i++) {
+    let {key, value} = attr[i];
+    if (key === OUTPUT_SHAPES_KEY) {
+     // Map all output tensors into array of numbers denoting their shape.
+     let result = value.list.shape.map(shape => {
+       if (shape.unknown_rank) {
+         // This output tensor is of unknown rank. We don't know if it is a
+         // scalar, or a tensor, or of what shape it is.
+         return null;
+       }
+       if (shape.dim == null ||
+           (shape.dim.length === 1 && shape.dim[0].size == null)) {
+         // This output tensor is a scalar.
+         return [];
+       }
+       // This output tensor has a known rank. Map each dimension size
+       // into a number.
+       return shape.dim.map(dim => {
+         // Size can be -1 if this particular dimension is unknown.
+         return dim.size;
+       });
+     });
+     // Since we already processed it, remove the entry from the attribute
+     // list (saves memory).
+     attr.splice(i, 1);
+     return result;
+    }
+  }
+  // We didn't find OUTPUT_SHAPES_KEY in attributes, so we don't know anything
+  // about the output tensors.
+  return null;
 }
 
 /**
@@ -649,8 +787,8 @@ class SeriesNodeImpl implements SeriesNode {
  */
 function normalizeInputs(inputs: string[]): NormalizedInput[] {
   return _.reduce(inputs, function(normalizedInputs, inputName) {
-    let start = inputName[0] === "^";
-    let colon = inputName.lastIndexOf(":");
+    let start = inputName[0] === '^';
+    let colon = inputName.lastIndexOf(':');
     let end = colon !== -1 &&
       inputName.length - colon > 1 &&
       !(/\D/).test(inputName.substring(colon + 1)) ?
@@ -677,7 +815,7 @@ function addEdgeToGraph(graph: SlimGraph, inputName: string,
   }
   // Check if this op type and input number corresponds to a
   // reference edge using the refEdges dictionary in the params.
-  let isRefEdge = params.refEdges[outputNode.op + " " + index] === true;
+  let isRefEdge = params.refEdges[outputNode.op + ' ' + index] === true;
   graph.edges.push({
     v: inputName,
     w: outputNode.name,
@@ -717,40 +855,39 @@ export function build(rawNodes: tf.TFNode[], params: BuildParams,
    */
   let nodeNames = new Array<string>(rawNodes.length);
 
-  return runAsyncTask("Normalizing names", 30, () => {
-    let opNodes = new Array<OpNode>(rawNodes.length);
-    let index = 0;
-    _.each(rawNodes, rawNode => {
-      let normalizedInputs = normalizeInputs(rawNode.input);
-      let opNode = new OpNodeImpl(rawNode, normalizedInputs);
-      if (isInEmbeddedPred(opNode)) {
-        embeddingNodeNames.push(opNode.name);
-        inEmbedding[opNode.name] = opNode;
-        return;
-      }
+  return runAsyncTask('Normalizing names', 30, () => {
+           let opNodes = new Array<OpNode>(rawNodes.length);
+           let index = 0;
+           _.each(rawNodes, rawNode => {
+             let opNode = new OpNodeImpl(rawNode);
+             if (isInEmbeddedPred(opNode)) {
+               embeddingNodeNames.push(opNode.name);
+               inEmbedding[opNode.name] = opNode;
+               return;
+             }
 
-      if (isOutEmbeddedPred(opNode)) {
-        embeddingNodeNames.push(opNode.name);
-        outEmbedding[opNode.name] = opNode;
-        _.each(opNode.inputs, input => {
-          let inputName = input.name;
-          outEmbeddings[inputName] = outEmbeddings[inputName] || [];
-          outEmbeddings[inputName].push(opNode);
-        });
-        return;
-      }
-      // The node is not an embedding, so add it to the names and nodes lists.
-      opNodes[index] = opNode;
-      nodeNames[index] = opNode.name;
-      index++;
-    });
-    opNodes.splice(index);
-    nodeNames.splice(index);
-    return opNodes;
-  }, tracker)
-  .then((opNodes) => {
+             if (isOutEmbeddedPred(opNode)) {
+               embeddingNodeNames.push(opNode.name);
+               outEmbedding[opNode.name] = opNode;
+               _.each(opNode.inputs, input => {
+                 let inputName = input.name;
+                 outEmbeddings[inputName] = outEmbeddings[inputName] || [];
+                 outEmbeddings[inputName].push(opNode);
+               });
+               return;
+             }
+             // The node is not an embedding, so add it to the names and nodes
+             // lists.
+             opNodes[index] = opNode;
+             nodeNames[index] = opNode.name;
+             index++;
+           });
+           opNodes.splice(index);
+           nodeNames.splice(index);
+           return opNodes;
+         }, tracker).then((opNodes) => {
     // Create the graph data structure from the graphlib library.
-    return runAsyncTask("Building the data structure", 70, () => {
+    return runAsyncTask('Building the data structure', 70, () => {
       let normalizedNameDict = mapStrictHierarchy(nodeNames,
         embeddingNodeNames);
       let graph = new SlimGraph;
@@ -759,7 +896,7 @@ export function build(rawNodes: tf.TFNode[], params: BuildParams,
       _.each(opNodes, opNode => {
         let normalizedName = normalizedNameDict[opNode.name] || opNode.name;
         graph.nodes[normalizedName] = opNode;
-        // Check if the node has out-embeddings. If yes, add them to to the
+        // Check if the node has out-embeddings. If yes, add them to the
         // node.
         if (opNode.name in outEmbeddings) {
           opNode.outEmbeddings = outEmbeddings[opNode.name];
@@ -811,9 +948,6 @@ export function build(rawNodes: tf.TFNode[], params: BuildParams,
 
       return graph;
     }, tracker);
-  })
-  .catch(function(reason) {
-    throw new Error("Failure creating graph");
   });
 };
 
@@ -825,7 +959,7 @@ export function createGraph<N, E>(name: string, type, opt = {}):
   let graph = new graphlib.Graph<N, E>(opt);
   graph.setGraph({
     name: name,
-    rankdir: "BT", // BT,TB,LR,RL
+    rankdir: 'BT',  // BT,TB,LR,RL
     type: type
   });
   return graph;
@@ -852,16 +986,16 @@ function getEmbedPredicate(types: string[]) {
  */
 function getStrictName(name: string): string {
   let parts = name.split(NAMESPACE_DELIM);
-  return name + NAMESPACE_DELIM + "(" + parts[parts.length - 1] + ")";
+  return name + NAMESPACE_DELIM + '(' + parts[parts.length - 1] + ')';
 }
 
 /**
  * For each op node (embedding or non-embedding), rename it if there is a
- * non-embedding node under its namespace. For example, assume node name "A".
- * If there is a non-embedding node under its namespace (e.g. "A/B"), "A" will
- * be renamed to "A/(A)". Then the namespace "A" will contain 2 nodes: "(A)"
- * and "B". If all the nodes under "A" are embedding nodes (e.g. constant and
- * summary), keep "A" as an Op node and don't create a namespace.
+ * non-embedding node under its namespace. For example, assume node name 'A'.
+ * If there is a non-embedding node under its namespace (e.g. 'A/B'), 'A' will
+ * be renamed to 'A/(A)'. Then the namespace 'A' will contain 2 nodes: '(A)'
+ * and 'B'. If all the nodes under 'A' are embedding nodes (e.g. constant and
+ * summary), keep 'A' as an Op node and don't create a namespace.
  *
  * @param nodeNames An array of regular (non-embedding) node names.
  * @param embeddingNodeNames An array of embedding node names.
@@ -884,9 +1018,16 @@ function mapStrictHierarchy(nodeNames: string[],
     _.each(getHierarchicalPath(a).slice(0, -1), ns => {
       namespaceSet[ns] = true;
     });
-    let b = nodeNames[i + 1];
-    if (_.startsWith(b, a + NAMESPACE_DELIM)) {
-      newNameDictionary[a] = getStrictName(a);
+    for (let j = i + 1; j < nodeNames.length; ++j) {
+      let b = nodeNames[j];
+      if (_.startsWith(b, a)) {
+        if (b.length > a.length && b.charAt(a.length) === NAMESPACE_DELIM) {
+          newNameDictionary[a] = getStrictName(a);
+          break;
+        }
+      } else {
+        break;
+      }
     }
   }
   // Go through all the embedding node names and rename them in case they
@@ -960,9 +1101,35 @@ export function getHierarchicalPath(name: string,
  */
 export function getIncludeNodeButtonString(include: InclusionType) {
   if (include === tf.graph.InclusionType.EXCLUDE) {
-    return "Add to main graph";
+    return 'Add to main graph';
   } else {
-    return "Remove from main graph";
+    return 'Remove from main graph';
   }
 };
+
+/**
+ * Returns the string for the series node grouping toggle button, dependant
+ * on the provided current SeriesGroupingType.
+ */
+export function getGroupSeriesNodeButtonString(group: SeriesGroupingType) {
+  if (group === tf.graph.SeriesGroupingType.GROUP) {
+    return 'Ungroup this series of nodes';
+  } else {
+    return 'Group this series of nodes';
+  }
+};
+
+/**
+ * Toggle the node series grouping option in the provided map, setting it
+ * to ungroup if the series is not already in the map.
+ */
+export function toggleNodeSeriesGroup(
+  map: { [name: string]: tf.graph.SeriesGroupingType }, name: string) {
+  if (!(name in map) || map[name] === tf.graph.SeriesGroupingType.GROUP) {
+    map[name] = tf.graph.SeriesGroupingType.UNGROUP;
+  } else {
+    map[name] = tf.graph.SeriesGroupingType.GROUP;
+  }
+};
+
 } // close module tf.graph
