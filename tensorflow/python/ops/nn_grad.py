@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,16 +51,16 @@ def _Conv2DBackpropGrad(op, grad):
 
 @ops.RegisterGradient("Conv3D")
 def _Conv3DGrad(op, grad):
-  return [nn_ops.conv3d_backprop_input(op.inputs[0],
-                                       op.inputs[1],
-                                       grad,
-                                       strides=op.get_attr("strides"),
-                                       padding=op.get_attr("padding")),
-          nn_ops.conv3d_backprop_filter(op.inputs[0],
-                                        op.inputs[1],
-                                        grad,
-                                        strides=op.get_attr("strides"),
-                                        padding=op.get_attr("padding"))]
+  return [nn_ops.conv3d_backprop_input_v2(array_ops.shape(op.inputs[0]),
+                                          op.inputs[1],
+                                          grad,
+                                          strides=op.get_attr("strides"),
+                                          padding=op.get_attr("padding")),
+          nn_ops.conv3d_backprop_filter_v2(op.inputs[0],
+                                           array_ops.shape(op.inputs[1]),
+                                           grad,
+                                           strides=op.get_attr("strides"),
+                                           padding=op.get_attr("padding"))]
 
 
 @ops.RegisterGradient("AvgPool3D")
@@ -110,6 +110,24 @@ def _SoftmaxGrad(op, grad_softmax):
   grad_x = ((grad_softmax - array_ops.reshape(
       math_ops.reduce_sum(grad_softmax * softmax, [1]), [-1, 1])) * softmax)
   return grad_x
+
+
+@ops.RegisterGradient("LogSoftmax")
+def _LogSoftmaxGrad(op, grad):
+  """The gradient for log_softmax.
+
+      log_softmax = input - log(sum(exp(input))
+      dlog_softmax/dinput = diag - softmax(input)
+
+  Args:
+    op: The log softmax op.
+    grad: The tensor representing the gradient w.r.t. the output.
+
+  Returns:
+    The gradients w.r.t. the input.
+  """
+  softmax = math_ops.exp(op.outputs[0])
+  return grad - math_ops.reduce_sum(grad, 1, keep_dims=True) * softmax
 
 
 @ops.RegisterGradient("BiasAdd")
@@ -250,6 +268,18 @@ def _DepthwiseConv2dNativeGrad(op, grad):
           op.inputs[0], array_ops.shape(op.inputs[1]), grad,
           op.get_attr("strides"), op.get_attr("padding"))
   ]
+
+
+@ops.RegisterGradient("Dilation2D")
+def _Dilation2DGrad(op, grad):
+  return [nn_ops.dilation2d_backprop_input(op.inputs[0], op.inputs[1], grad,
+                                           op.get_attr("strides"),
+                                           op.get_attr("rates"),
+                                           op.get_attr("padding")),
+          nn_ops.dilation2d_backprop_filter(op.inputs[0], op.inputs[1], grad,
+                                            op.get_attr("strides"),
+                                            op.get_attr("rates"),
+                                            op.get_attr("padding"))]
 
 
 @ops.RegisterGradient("LRN")

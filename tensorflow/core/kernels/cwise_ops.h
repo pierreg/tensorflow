@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -350,6 +350,18 @@ struct sin : base<T, Eigen::internal::scalar_sin_op<T> > {};
 template <typename T>
 struct cos : base<T, Eigen::internal::scalar_cos_op<T> > {};
 
+template <typename T>
+struct tan : base<T, Eigen::internal::scalar_tan_op<T> > {};
+
+template <typename T>
+struct asin : base<T, Eigen::internal::scalar_asin_op<T> > {};
+
+template <typename T>
+struct acos : base<T, Eigen::internal::scalar_acos_op<T> > {};
+
+template <typename T>
+struct atan : base<T, Eigen::internal::scalar_atan_op<T> > {};
+
 struct logical_not : base<bool, Eigen::internal::scalar_boolean_not_op<bool> > {
 };
 
@@ -478,6 +490,12 @@ struct igamma : base<T, Eigen::internal::scalar_igamma_op<T>> {};
 
 template <typename T>
 struct igammac : base<T, Eigen::internal::scalar_igammac_op<T>> {};
+
+template <typename T>
+struct zeta : base<T, Eigen::internal::scalar_zeta_op<T>> {};
+
+template <typename T>
+struct polygamma : base<T, Eigen::internal::scalar_polygamma_op<T>> {};
 
 template <typename T>
 struct squared_difference

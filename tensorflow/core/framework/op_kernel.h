@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -490,6 +490,7 @@ class OpKernelContext {
     }
 
     bool track_allocations = false;
+    bool log_memory = false;
 
     // Array indexed by output number for this node
     const AllocatorAttributes* output_attr_array = nullptr;
@@ -532,6 +533,7 @@ class OpKernelContext {
     // Function call supports.
     FunctionCallFrame* call_frame = nullptr;
     FunctionLibraryRuntime* function_library = nullptr;
+    std::function<void(std::function<void()>)>* runner = nullptr;
 
     // TensorSliceReaderCache support.
     checkpoint::TensorSliceReaderCacheWrapper* slice_reader_cache = nullptr;
@@ -865,6 +867,10 @@ class OpKernelContext {
   // library. E.g., CHECK_NOTNULL(function_library())->Run("Foo", ...).
   FunctionLibraryRuntime* function_library() const {
     return params_->function_library;
+  }
+
+  std::function<void(std::function<void()>)>* runner() const {
+    return params_->runner;
   }
 
   // Shared resources accessible to this kernel.
