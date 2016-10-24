@@ -19,7 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import functools
-import sys
+import hashlib
 import numpy as np
 
 from tensorflow.python.framework import constant_op
@@ -197,8 +197,8 @@ def log_combinations(n, counts, name="log_combinations"):
   # The sum should be along the last dimension of counts.  This is the
   # "distribution" dimension. Here n a priori represents the sum of counts.
   with ops.name_scope(name, values=[n, counts]):
-    n = array_ops.identity(n, name="n")
-    counts = array_ops.identity(counts, name="counts")
+    n = ops.convert_to_tensor(n, name="n")
+    counts = ops.convert_to_tensor(counts, name="counts")
     total_permutations = math_ops.lgamma(n + 1)
     counts_factorial = math_ops.lgamma(counts + 1)
     redundant_permutations = math_ops.reduce_sum(counts_factorial,
@@ -397,35 +397,69 @@ def pick_vector(cond,
                            [math_ops.select(cond, n, -1)])
 
 
-def override_docstring_if_empty(fn, doc_str):
-  """Override the `doc_str` argument to `fn.__doc__`.
-
-  This function is primarily needed because Python 3 changes how docstrings are
-  programmatically set.
-
-  Args:
-    fn: Class function.
-    doc_str: String
-  """
-  if sys.version_info.major < 3:
-    if fn.__func__.__doc__ is None:
-      fn.__func__.__doc__ = doc_str
-  else:
-    if fn.__doc__ is None:
-      fn.__doc__ = doc_str
+def gen_new_seed(seed, salt):
+  """Generate a new seed, from the given seed and salt."""
+  if seed:
+    string = (str(seed) + salt).encode("utf-8")
+    return int(hashlib.md5(string).hexdigest()[:8], 16) & 0x7FFFFFFF
+  return None
 
 
 class AppendDocstring(object):
+  """Helper class to promote private subclass docstring to public counterpart.
 
-  def __init__(self, string):
-    self._string = string
+  Example:
+
+  ```python
+  class TransformedDistribution(Distribution):
+    @distribution_util.AppendDocstring(
+      additional_note="A special note!",
+      condition_kwargs_dict={"foo": "An extra arg."})
+    def _prob(self, y, foo=None):
+      pass
+  ```
+
+  In this case, the `AppendDocstring` decorator appends the `additional_note` to
+  the docstring of `prob` (not `_prob`) and adds a new `condition_kwargs`
+  section with each dictionary item as a bullet-point.
+
+  For a more detailed example, see `TransformedDistribution`.
+  """
+
+  def __init__(self, additional_note="", condition_kwargs_dict=None):
+    """Initializes the AppendDocstring object.
+
+    Args:
+      additional_note: Python string added as additional docstring to public
+        version of function.
+      condition_kwargs_dict: Python string/string dictionary representing
+        specific kwargs expanded from the **condition_kwargs input.
+
+    Raises:
+      ValueError: if condition_kwargs_dict.key contains whitespace.
+      ValueError: if condition_kwargs_dict.value contains newlines.
+    """
+    self._additional_note = additional_note
+    if condition_kwargs_dict:
+      bullets = []
+      for (key, value) in condition_kwargs_dict.items():
+        if any(x.isspace() for x in key):
+          raise ValueError(
+              "Parameter name \"%s\" contains whitespace." % key)
+        value = value.lstrip()
+        if "\n" in value:
+          raise ValueError(
+              "Parameter description for \"%s\" contains newlines." % key)
+        bullets.append("*  <b>`%s`</b>: %s" % (key, value))
+      self._additional_note += ("\n\n##### <b>`condition_kwargs`</b>:\n\n" +
+                                "\n".join(bullets))
 
   def __call__(self, fn):
     @functools.wraps(fn)
     def _fn(*args, **kwargs):
       return fn(*args, **kwargs)
     if _fn.__doc__ is None:
-      _fn.__doc__ = self._string
+      _fn.__doc__ = self._additional_note
     else:
-      _fn.__doc__ += "\n%s" % self._string
+      _fn.__doc__ += "\n%s" % self._additional_note
     return _fn
